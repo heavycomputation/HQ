@@ -8,30 +8,25 @@
 
 ---
 
-Every time you ship something, you provision a box, lock it down the same way,
-and then spend the rest of the project SSHing in to deploy, maintain, and debug
-it. HQ is a lightweight home for handing that work to an agent instead.
+The problem HQ intends to solve is this: Before HQ, I would manually go into the Hetzner dashboard, provision a server, ssh in, configure it with the same security setup I always use, and deploy my app. I tend to use Rama for my app backends, so I also setup the box as a single-node rama cluster. Doing all of this each time takes several hours, and I do it infrequently enough that I forget important details and have to relearn.
 
-Clone this repo, add your secrets to `.env`, and point your coding agent
-(Claude Code, Codex, Gemini CLI, …) at it. From there you build up:
+I then started experimenting with using an LLM agent on the server and providing it with all the important context and references so it can do it for me. This is useful, but still not quite as easy as I want.
 
-- **Skills** — repeatable, scriptable procedures (provision a box, harden it,
-  deploy an app) your agent runs on demand.
-- **Server context** — a folder per live box under [`servers/`](servers/) holding
-  the standing context an agent needs to operate it: what's deployed, where the
-  logs are, the gotchas, and any per-box ops scripts.
+So, I created new local project - called it 'HQ' - and added my Hetzner API keys and tailscale auth key, a write up of the security setup I like (tailscale + Cloudflare tunnel), a document on how to setup a single node rama cluster, and my Clojure app jar file. Claude then undertook the whole setup, from provisioning the server through Hetzner, SSH'ing into the box, locking it down with my security setup, booting a rama cluster, and deploying my app.
 
-This repo is the **raw scaffolding** — an empty frame you grow into your own HQ.
-It ships with no skills and no agent config; you add those as you go, so every
-capability is one you understand and trust.
+This saved me several hours. Possibly a whole day.
+
+But the more important finding was that I could then have Claude debug all the issues with my live app on an ongoing basis. Everytime a bug was flagged, I booted Claude, pointed it at the live server, and it found all previous context, SSH'd in, debugged, and either fixed on the spot or suggested a fix in my codebase (which my other Claude could then fix, commit, push, and uberjar).
+
+And so HQ has become the central way in which the production-side of my apps are managed.
+
+HQ is a central repository for managing LLM agents which are deployed onto the task of managing your Hetzner servers. It provides a lightweight scaffolded project structure which is intended to evolve and grow as the context around your desired setup grows.
 
 ## Setup
 
 ```bash
 cp .env.example .env    # then fill in your secrets
 ```
-
-`.env` holds live secrets and is gitignored — never commit it.
 
 ## `servers/` — your live boxes
 
