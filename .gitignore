@@ -1,0 +1,18 @@
+# Secrets — never commit these
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+authkey*
+*-authkey*
+
+# Per-box context is private — keep real servers out of a public repo.
+# Only the your-app-name template is committed; boxes you add stay untracked.
+servers/*/
+!servers/your-app-name/
+
+# Generated / local
+*.rendered.sh
+scratch/
+.DS_Store
