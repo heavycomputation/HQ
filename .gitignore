@@ -8,9 +8,8 @@ authkey*
 *-authkey*
 
 # Per-box context is private — keep real servers out of a public repo.
-# Only the your-app-name template is committed; boxes you add stay untracked.
+# servers/ ships empty; every box folder you add stays untracked.
 servers/*/
-!servers/your-app-name/
 
 # Generated / local
 *.rendered.sh
