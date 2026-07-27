@@ -2,21 +2,26 @@
 #
 # lockdown.sh — app-agnostic security baseline for a fresh Ubuntu/Debian VPS.
 #
-# Standalone and dependency-free: no other file in this repo is required. Safe to
-# run unattended as cloud-init user-data, or by hand (ssh in as root and run it).
+# Standalone and dependency-free: no other file in this repo is required. Runs
+# unattended as cloud-init user-data at first boot, or by hand from any root shell
+# (the Hetzner console, or an existing Tailscale SSH session).
 #
 # Configuration comes from the environment:
 #
-#   TAILSCALE_AUTHKEY     (required)  reusable, persistent Tailscale auth key
+#   TAILSCALE_AUTHKEY     (required)  reusable, non-ephemeral Tailscale auth key
 #   TAILSCALE_HOSTNAME    (optional)  name to register in your tailnet (default: hostname)
+#   TAILSCALE_TAGS        (optional)  comma-separated ACL tags, e.g. "tag:server"
 #   CREATE_DEPLOY_USER    (optional)  "true" to create a non-root sudo user (default: true)
 #   DEPLOY_USER           (optional)  name of that user (default: deploy)
-#   DISABLE_ROOT_SSH      (optional)  "true" sets PermitRootLogin no (default: false)
 #   ALLOW_CLOUDFLARE_WEB  (optional)  "true" opens 80/443 to Cloudflare only (default: true)
 #
-# SAFETY: SSH is only restricted to the Tailscale interface AFTER Tailscale is
-# confirmed up. If Tailscale fails, port 22 is left open on the public IP so you are
-# never locked out — the failure is logged loudly instead.
+# Administrative access is Tailscale SSH: tailscaled itself answers port 22 on the
+# tailnet address and authorizes you against your tailnet identity and SSH policy.
+# There are no authorized_keys and no passwords anywhere in this baseline.
+#
+# SAFETY: the script aborts before touching sshd or the firewall if the tailnet join
+# does not confirm, leaving the box exactly as it was rather than sealing it with no
+# way back in. Break-glass is always the Hetzner console.
 #
 # Re-runnable: every step is idempotent.
 
@@ -25,9 +30,9 @@ set -euo pipefail
 # ----- config with defaults --------------------------------------------------
 TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-}"
 TAILSCALE_HOSTNAME="${TAILSCALE_HOSTNAME:-$(hostname)}"
+TAILSCALE_TAGS="${TAILSCALE_TAGS:-}"
 CREATE_DEPLOY_USER="${CREATE_DEPLOY_USER:-true}"
 DEPLOY_USER="${DEPLOY_USER:-deploy}"
-DISABLE_ROOT_SSH="${DISABLE_ROOT_SSH:-false}"
 ALLOW_CLOUDFLARE_WEB="${ALLOW_CLOUDFLARE_WEB:-true}"
 
 SUMMARY_LOG="/var/log/hq-lockdown.log"
@@ -36,6 +41,11 @@ log() { echo "[lockdown] $*" | tee -a "$SUMMARY_LOG" >&2; }
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "[lockdown] must run as root." >&2
+  exit 1
+fi
+
+if [ -z "$TAILSCALE_AUTHKEY" ]; then
+  echo "[lockdown] TAILSCALE_AUTHKEY is required — it is the only way back into this box." >&2
   exit 1
 fi
 
@@ -62,8 +72,9 @@ EOF
 systemctl enable --now unattended-upgrades
 
 # ----- 3. Non-root deploy user -----------------------------------------------
-# Reuses the SSH key already installed for root, so the same master key logs in
-# as the deploy user too.
+# No keys and no password: you reach this account through Tailscale SSH, which
+# authorizes you by tailnet identity. Grant it in your SSH policy via
+# "users": ["deploy"].
 if [ "$CREATE_DEPLOY_USER" = "true" ]; then
   log "[3/6] Creating deploy user '$DEPLOY_USER'..."
   if ! id "$DEPLOY_USER" &>/dev/null; then
@@ -73,14 +84,6 @@ if [ "$CREATE_DEPLOY_USER" = "true" ]; then
   # passwordless sudo so unattended deploys don't hang on a prompt
   echo "$DEPLOY_USER ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/90-$DEPLOY_USER"
   chmod 440 "/etc/sudoers.d/90-$DEPLOY_USER"
-  if [ -f /root/.ssh/authorized_keys ]; then
-    install -d -m 700 -o "$DEPLOY_USER" -g "$DEPLOY_USER" "/home/$DEPLOY_USER/.ssh"
-    install -m 600 -o "$DEPLOY_USER" -g "$DEPLOY_USER" \
-      /root/.ssh/authorized_keys "/home/$DEPLOY_USER/.ssh/authorized_keys"
-  else
-    log "!! /root/.ssh/authorized_keys not found — '$DEPLOY_USER' has no SSH key."
-    log "!! Tailscale SSH will still let you in as this user."
-  fi
 else
   log "[3/6] Skipping deploy user (CREATE_DEPLOY_USER=$CREATE_DEPLOY_USER)."
 fi
@@ -91,46 +94,41 @@ if ! command -v tailscale &>/dev/null; then
   curl -fsSL https://tailscale.com/install.sh | sh
 fi
 
-TAILSCALE_UP=false
+TS_ARGS=(--authkey="$TAILSCALE_AUTHKEY" --hostname="$TAILSCALE_HOSTNAME" --ssh)
+[ -n "$TAILSCALE_TAGS" ] && TS_ARGS+=(--advertise-tags="$TAILSCALE_TAGS")
+
+log "Joining tailnet as '$TAILSCALE_HOSTNAME'..."
 TAILSCALE_IP=""
-if [ -n "$TAILSCALE_AUTHKEY" ]; then
-  log "Joining tailnet as '$TAILSCALE_HOSTNAME'..."
-  if tailscale up --authkey="$TAILSCALE_AUTHKEY" --hostname="$TAILSCALE_HOSTNAME" --ssh; then
-    for _ in $(seq 1 30); do
-      TAILSCALE_IP="$(tailscale ip -4 2>/dev/null || true)"
-      [ -n "$TAILSCALE_IP" ] && break
-      sleep 1
-    done
-    if [ -n "$TAILSCALE_IP" ]; then
-      TAILSCALE_UP=true
-      log "Tailscale up. IP: $TAILSCALE_IP"
-    else
-      log "!! Tailscale joined but no tailnet IPv4 appeared within 30s."
-    fi
-  else
-    log "!! 'tailscale up' failed — check the auth key is valid and not expired."
-  fi
-else
-  log "!! No TAILSCALE_AUTHKEY provided — skipping Tailscale join."
+if tailscale up "${TS_ARGS[@]}"; then
+  for _ in $(seq 1 30); do
+    TAILSCALE_IP="$(tailscale ip -4 2>/dev/null || true)"
+    [ -n "$TAILSCALE_IP" ] && break
+    sleep 1
+  done
 fi
 
+if [ -z "$TAILSCALE_IP" ]; then
+  log "!! Tailnet join did not confirm — aborting before the box is sealed."
+  log "!! Nothing has been firewalled; this machine is unchanged and still reachable."
+  log "!! Usual causes: expired or single-use auth key, or a key not authorized to"
+  log "!! assign TAILSCALE_TAGS='$TAILSCALE_TAGS'. Fix the key and re-run this script."
+  exit 1
+fi
+log "Tailscale up. IP: $TAILSCALE_IP"
+
 # ----- 5. Harden sshd --------------------------------------------------------
-# Done BEFORE enabling the firewall: if you are running this over public-IP SSH,
-# enabling UFW drops that session, so sshd must already be hardened by then.
+# Tailscale SSH answers port 22 on the tailnet address, so sshd is not the way in.
+# It is locked to nothing-works-by-default in case anything ever reaches it.
 log "[5/6] Hardening sshd..."
 mkdir -p /etc/ssh/sshd_config.d
 SSHD_CONF="/etc/ssh/sshd_config.d/99-hardening.conf"
-{
-  echo "# Managed by HQ skills/lockdown — edits will be overwritten on re-run."
-  echo "PasswordAuthentication no"
-  echo "ChallengeResponseAuthentication no"
-  echo "KbdInteractiveAuthentication no"
-  if [ "$DISABLE_ROOT_SSH" = "true" ]; then
-    echo "PermitRootLogin no"
-  else
-    echo "PermitRootLogin prohibit-password"
-  fi
-} > "$SSHD_CONF"
+cat > "$SSHD_CONF" <<'EOF'
+# Managed by HQ skills/lockdown — edits will be overwritten on re-run.
+PasswordAuthentication no
+ChallengeResponseAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+EOF
 chmod 644 "$SSHD_CONF"
 # Ubuntu 24.04 uses the 'ssh' unit; older releases use 'sshd'.
 sshd -t && { systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true; }
@@ -142,6 +140,10 @@ ufw default allow outgoing
 
 # Tailscale direct connections
 ufw allow 41641/udp comment 'tailscale'
+
+# Administrative access: port 22 on the tailnet interface only, where tailscaled
+# is listening. Nothing on the public IP.
+ufw allow in on tailscale0 to any port 22 proto tcp comment 'ssh via tailnet'
 
 if [ "$ALLOW_CLOUDFLARE_WEB" = "true" ]; then
   log "Allowing 80/443 from Cloudflare ranges only..."
@@ -171,33 +173,16 @@ else
   log "Ports 80/443 stay closed — open them yourself when you deploy a web app."
 fi
 
-# SSH access rule — lockout-safe
-if [ "$TAILSCALE_UP" = "true" ]; then
-  ufw allow in on tailscale0 to any port 22 proto tcp comment 'ssh via tailnet'
-  ufw --force delete allow 22/tcp 2>/dev/null || true
-  log "SSH restricted to the Tailscale interface only."
-else
-  # Fail SAFE: Tailscale unconfirmed → keep public SSH so you aren't locked out.
-  ufw allow 22/tcp comment 'PUBLIC ssh — close once tailnet works'
-  log "!! Tailscale NOT confirmed up — leaving PUBLIC SSH (port 22) OPEN."
-  log "!! Fix Tailscale, then close it by hand: ufw delete allow 22/tcp"
-fi
-
-log "Enabling UFW (this drops any SSH session on the public IP)..."
+log "Enabling UFW..."
 ufw --force enable
 
 echo ""
 echo "================================================"
 echo "  Lockdown complete"
 echo "================================================"
-if [ "$TAILSCALE_UP" = "true" ]; then
-  echo "  Tailscale IP : $TAILSCALE_IP"
-  echo "  SSH (root)   : ssh root@$TAILSCALE_HOSTNAME"
-  [ "$CREATE_DEPLOY_USER" = "true" ] && \
-  echo "  SSH (deploy) : ssh $DEPLOY_USER@$TAILSCALE_HOSTNAME"
-else
-  echo "  WARNING: Tailscale did not come up. Public SSH left OPEN."
-  echo "  Fix Tailscale, verify tailnet access, then: ufw delete allow 22/tcp"
-fi
+echo "  Tailscale IP : $TAILSCALE_IP"
+echo "  SSH (root)   : ssh root@$TAILSCALE_HOSTNAME"
+[ "$CREATE_DEPLOY_USER" = "true" ] && \
+echo "  SSH (deploy) : ssh $DEPLOY_USER@$TAILSCALE_HOSTNAME"
 echo "  Log          : $SUMMARY_LOG"
 echo "================================================"

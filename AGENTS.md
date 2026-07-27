@@ -12,15 +12,21 @@ This is HQ, a central repo from which we will provision, configure, maintain, an
 
 **readme.md** - user-facing readme file which you should not read unless explicitly asked. AGENTS.md is a sufficient entry point to gain context on the project.
 
+# Access
+
+Servers are reached over Tailscale SSH (`ssh deploy@<server-name>`), authorized by tailnet identity and the tailnet SSH policy. There are no SSH keys anywhere in this workflow — do not generate one, do not add one to a Hetzner server, and do not write to an authorized_keys file on a box. If a server is unreachable, the break-glass path is the Hetzner Cloud Console, not a key.
+
 # Provisioning
 
 When provisioning a server, ask step-by-step for answers to the configuration settings. How much RAM, x86 or ARM, location, etc. Don't assume, and always ask one step at a time to allow for easy Q&A back and forth. Keep responses extra concise during this setup stage. This rule can be overriden if I point you to a skill for provisioning or if I've asked you to make the decisions.
+
+Create servers with **skills/lockdown**'s script as cloud-init user-data so the box hardens itself and joins the tailnet on first boot. That is the default path — it means the machine is never touched before it is secured.
 
 After provisioning a server, always create an AGENTS.md file at **servers/project-name/AGENTS.md** with a section detailing the basics of the machine for all future agent reference.
 
 # Setup
 
-All new servers should be locked down and secured before the bulk of the work is initiated. HQ comes preloaded with **skills/lockdown** which shows you how to lock down a server with Tailscale and Cloudflare so that only we can ssh in from this machine. This rule can be overriden if a user asks or if another security method is provided.
+All new servers should be locked down and secured before the bulk of the work is initiated. HQ comes preloaded with **skills/lockdown** which shows you how to lock down a server with Tailscale and Cloudflare so that only our tailnet can reach it. This rule can be overriden if a user asks or if another security method is provided.
 
 After setting up the server, always add a section in **servers/project-name/AGENTS.md** explaining in brief the setup you performed or cite the specific skill you used (such as **skills/lockdown** to save re-explaining an existing skill).
 
