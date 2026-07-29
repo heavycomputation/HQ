@@ -50,7 +50,27 @@ Also required locally: `curl`, `jq`, and your own machine logged into the tailne
 set -a; source .env; set +a
 mkdir -p scratch                      # gitignored
 TS=(-u "$TAILSCALE_API_KEY:" -H 'Content-Type: application/json')
+HZ=(-H "Authorization: Bearer $HETZNER_API_TOKEN" -H 'Content-Type: application/json')
 SERVER_NAME=<server-name>
+```
+
+### 0. Pick a server type that can actually be ordered
+
+`AGENTS.md` says to ask the user about type and location one question at a time. Get the
+real options first — **`server_types[].prices` lists every location a type is *priced*
+in, not where it can be *ordered***. Sorting that list naively picks something that
+fails to create. Availability lives in `/v1/datacenters` → `.server_types.available`:
+
+```bash
+curl -fsS "${HZ[@]}" https://api.hetzner.cloud/v1/datacenters > scratch/dcs.json
+curl -fsS "${HZ[@]}" 'https://api.hetzner.cloud/v1/server_types?per_page=50' > scratch/types.json
+jq -r --slurpfile dc scratch/dcs.json '
+  [ $dc[0].datacenters[] as $d | ($d.server_types.available[] as $id | {dc:$d.name, loc:$d.location.name, id:$id}) ] as $pairs |
+  .server_types as $types |
+  [ $pairs[] | . as $p | ($types[] | select(.id==$p.id)) as $t |
+    ($t.prices[] | select(.location==$p.loc)) as $pr |
+    {price:($pr.price_monthly.gross|tonumber), name:$t.name, dc:$p.dc, arch:$t.architecture, cores:$t.cores, mem:$t.memory} ]
+  | sort_by(.price) | .[0:8][] | [.price,.name,.dc,.arch,.cores,.mem] | @tsv' scratch/types.json
 ```
 
 ### 1. Ensure the tailnet policy allows tagged servers
@@ -92,7 +112,8 @@ jq '
 diff <(jq -S . scratch/acl.json) <(jq -S . scratch/acl-new.json) || true
 ```
 
-If the diff is empty the policy is already correct — skip the write. Otherwise:
+If the diff is empty the policy is already correct — **skip the write entirely**, which
+also leaves the user's HuJSON comments untouched. Otherwise:
 
 ```bash
 curl -fsS -X POST "${TS[@]}" -H "If-Match: $ETAG" \
@@ -112,20 +133,32 @@ policy has never been touched you can pass `If-Match: "ts-default"`.
 ### 2. Mint a single-use auth key for this box
 
 ```bash
-AUTHKEY=$(curl -fsS "${TS[@]}" https://api.tailscale.com/api/v2/tailnet/-/keys \
-  --data-binary "$(jq -n --arg d "hq lockdown: $SERVER_NAME" '{
+KEYJSON=$(curl -fsS "${TS[@]}" https://api.tailscale.com/api/v2/tailnet/-/keys \
+  --data-binary "$(jq -n --arg d "hq lockdown $SERVER_NAME" '{
     capabilities: {devices: {create: {
       reusable: false, ephemeral: false, preauthorized: true, tags: ["tag:server"]
     }}},
     expirySeconds: 3600,
     description: $d
-  }')" | jq -r .key)
+  }')")
+AUTHKEY=$(jq -r .key <<<"$KEYJSON")
+KEYID=$(jq -r .id  <<<"$KEYJSON")
 ```
 
+No colon in the description — Tailscale rejects it with
+`{"message":"keys: description had invalid characters"}` (HTTP 400). Keep it
+alphanumeric, spaces and dashes.
+
 Single-use and one hour by design: the copy that ends up in the box's user-data is spent
-the moment the box joins, so it is worthless to anyone reading it later. If a run fails,
-mint a fresh one — it is one call. Non-ephemeral so the node survives going offline;
-tagged so the node never expires.
+the moment the box joins, so it is worthless to anyone reading it later. Non-ephemeral so
+the node survives going offline; tagged so the node never expires.
+
+Keep `$KEYID` — if the run fails before the key is consumed it stays valid until expiry,
+so revoke it rather than waiting the hour out:
+
+```bash
+curl -sS -X DELETE "${TS[@]}" "https://api.tailscale.com/api/v2/tailnet/-/keys/$KEYID"
+```
 
 ### 3. Build the user-data
 
@@ -141,35 +174,91 @@ tagged so the node never expires.
 
 ### 4. Create the server
 
-Per `AGENTS.md`, ask the user for type/image/location one question at a time rather than
-assuming. Attach **no SSH key** — there is no key in this workflow.
+Attach **no SSH key** — there is no key in this workflow.
 
 ```bash
-curl -fsS -X POST https://api.hetzner.cloud/v1/servers \
-  -H "Authorization: Bearer $HETZNER_API_TOKEN" -H 'Content-Type: application/json' \
+curl -fsS -X POST "${HZ[@]}" https://api.hetzner.cloud/v1/servers \
   -d "$(jq -n --arg n "$SERVER_NAME" --rawfile ud scratch/user-data.sh '{
     name: $n, server_type: "<type>", image: "<image>", location: "<loc>",
     user_data: $ud
-  }')"
+  }')" > scratch/create-response.json
+jq '.server.id, .server.public_net.ipv4.ip' scratch/create-response.json
 ```
 
-The box hardens itself on first boot and appears in your tailnet ready to use — it is
-never touched before it is secured. Takes ~1–3 minutes, mostly `apt upgrade`.
+> **That response body contains a `root_password`** — Hetzner generates one whenever no
+> SSH key is attached. Do not print it, and do not leave it on disk. Either redact it
+> (`jq 'del(.root_password)'`) before saving, or delete `scratch/create-response.json`
+> once you have the id and IP.
 
-### 5. Verify, then clean up
+The box hardens itself on first boot and appears in your tailnet ready to use — it is
+never touched before it is secured. Takes ~1–3 minutes.
+
+### 5. Verify
+
+**If the node has not appeared in your tailnet within ~5 minutes, the run failed.** Go
+straight to break-glass below and read the log; do not keep waiting.
 
 ```bash
-ssh deploy@$SERVER_NAME 'whoami && sudo -n true && echo sudo ok'
-ssh deploy@$SERVER_NAME 'sudo ufw status verbose'      # default deny, tailscale0:22, CF rules
-ssh root@$SERVER_NAME  'cat /var/log/hq-lockdown.log'  # full run log
-nc -vz -w 5 <public-ip> 22                             # from off-tailnet: must time out
+tailscale status | grep "$SERVER_NAME"        # run locally — the box has no jq
 
-rm -f scratch/user-data.sh
+ssh deploy@$SERVER_NAME 'whoami && sudo -n true && echo sudo ok'
+ssh deploy@$SERVER_NAME 'sudo ufw status verbose'          # default deny, tailscale0:22, CF rules
+ssh deploy@$SERVER_NAME 'sudo sshd -T | grep -E "^(passwordauthentication|permitrootlogin)"'
+ssh root@$SERVER_NAME   'cat /var/log/hq-lockdown.log'     # full run log, incl. any warnings
+```
+
+Confirm the public surface is closed. Do **not** use `nc -w` — macOS `nc` ignores it on
+a filtered port and hangs for minutes:
+
+```bash
+probe() {  # exit 28 = blocked (what we want); 0 = open; 7 = refused
+  curl -sS --connect-timeout 8 "telnet://$1:$2" </dev/null >/dev/null 2>&1
+  case $? in 28) echo "  $2: blocked (ok)";; 0) echo "  $2: OPEN — investigate";;
+             7) echo "  $2: refused (reachable but nothing listening)";;
+             *) echo "  $2: curl exit $? — check manually";; esac
+}
+for p in 22 80 443; do probe <public-ip> $p; done
+rm -f scratch/user-data.sh scratch/create-response.json
 ```
 
 **On a box that already exists**, skip steps 3–4: get a root shell (Tailscale SSH if it
-is already on your tailnet, otherwise the Hetzner console), export the same vars, and run
-the script directly.
+is already on your tailnet, otherwise break-glass), export the same vars, and run the
+script directly. Re-running on a live box is safe and preserves access, including with
+an already-spent auth key.
+
+## Break-glass — the run failed and there is no tailnet
+
+The Hetzner console is the documented last resort, but it is a browser VNC session and
+you cannot use it. This path is fully API-driven:
+
+```bash
+curl -fsS -X POST "${HZ[@]}" \
+  https://api.hetzner.cloud/v1/servers/<id>/actions/reset_password | jq -r .root_password
+```
+
+Then a password SSH session — macOS ships `expect`; `sshpass` is not installed. Read
+**`/var/log/cloud-init-output.log`**, and `/var/log/hq-lockdown.log` (the script mirrors
+all subprocess output into it, so the real error should be there).
+
+Two things to say to the user when you do this: it is a **temporary** deviation from the
+no-keys/no-passwords model, so the box must be re-locked or destroyed afterwards; and
+the reset password must not be written to disk or into any repo file.
+
+## Decommissioning
+
+Destroying the Hetzner box leaves its tailnet device behind forever. Do both, or stale
+nodes accumulate in the tailnet:
+
+```bash
+curl -sS -X DELETE "${HZ[@]}" https://api.hetzner.cloud/v1/servers/<id>
+
+DEVID=$(curl -fsS "${TS[@]}" https://api.tailscale.com/api/v2/tailnet/-/devices \
+  | jq -r --arg n "$SERVER_NAME" '.devices[] | select(.hostname == $n) | .id')
+curl -sS -X DELETE "${TS[@]}" "https://api.tailscale.com/api/v2/device/$DEVID"
+```
+
+Also revoke the auth key if the run failed before it was consumed (step 2), and delete
+`servers/<project>/` if the box was a throwaway.
 
 ## Configuration
 
@@ -186,20 +275,40 @@ All script config is environment variables — nothing is read from files.
 
 ## What the script does
 
-1. `apt update && upgrade`, installs `curl`, `ufw`, `unattended-upgrades`. Retries
-   through the dpkg lock that cloud-init and `apt-daily` hold on first boot.
-2. Enables unattended security upgrades.
-3. Creates the non-root `deploy` user with passwordless sudo — no key, no password.
-4. Installs Tailscale and joins the tailnet with `--ssh`, waiting up to 30s to confirm.
-   **Aborts here if the join does not confirm**, leaving the box untouched and still
-   reachable rather than sealing it with no way in.
-5. Hardens `sshd`: no passwords, no root login.
-6. Configures UFW default-deny, tailnet-only port 22, Cloudflare-only web ports.
+The order is deliberate: **get reachable, get sealed, then everything else.** A fresh
+Hetzner box boots with every port open and sshd accepting passwords, so a failure that
+leaves it in that state is the worst outcome.
 
-Every step is idempotent; re-running is safe.
+1. `apt update`, installs just `curl` and `ufw`.
+2. Installs Tailscale and joins the tailnet with `--ssh`. **Aborts here if the join does
+   not confirm**, before anything has been changed — the box is left untouched and still
+   reachable rather than sealed with no way in.
+3. UFW default-deny, tailnet-only port 22, `41641/udp`, enabled immediately. From here
+   the box is both reachable and closed.
+4. Creates the non-root `deploy` user with passwordless sudo — no key, no password.
+5. Hardens `sshd`, then **verifies the effective config** with `sshd -T` rather than
+   assuming the drop-in won.
+6. Cloudflare-only web ports.
+7. `apt upgrade` and unattended security upgrades — last, because it is the slowest and
+   most failure-prone step and the security posture is already final by then.
+
+Every step is idempotent; re-running is safe. Any unexpected failure is trapped, logged
+with its line number, and reported — including whether UFW got enabled, so you know
+whether the box is exposed. All subprocess output is mirrored into
+`/var/log/hq-lockdown.log`.
 
 ## Gotchas
 
+- **`useradd`, never `adduser`.** `adduser --gecos ""` shells out to `/bin/chfn`, and PAM
+  refuses chfn while the caller's password is expired. Hetzner force-expires root's
+  password on every box created without an SSH key — which is every box here — so
+  `adduser` fails 100% of the time on a real first boot. Worse, it fails *after*
+  partially creating the account, so a later `id deploy` succeeds and hides the bug on a
+  manual re-run.
+- **sshd honours the FIRST value for a keyword**, and reads `sshd_config.d/*.conf` in
+  sort order. cloud-init ships `50-cloud-init.conf` with `PasswordAuthentication yes`,
+  so the hardening drop-in must sort before it — hence `00-hq-hardening.conf`. Always
+  check `sshd -T`, never just that the file was written.
 - **`"action": "accept"`, never `"check"`.** The stock policy's SSH rule is `check`,
   which forces an interactive browser re-auth and will stall an unattended agent
   mid-run. The stock rule also targets `autogroup:self`, which does not match a tagged
@@ -212,16 +321,14 @@ Every step is idempotent; re-running is safe.
 - **A restrictive ACL still applies.** The default `src: ["*"] / dst: ["*:*"]` rule
   covers tagged nodes, but a tailnet with a narrowed `acls` block may also need
   `tag:server` added there. The SSH rule alone is not enough.
-- **Tag your servers.** An untagged node inherits the key creator's identity and the
-  default ~180-day key expiry; when it expires the box silently drops off the tailnet
-  and the only way back is the Hetzner console.
-- **Cloudflare ranges are fetched live** from `cloudflare.com/ips-v4`/`-v6`. Both lists
-  must arrive or the script uses its pinned fallback wholesale — a half-fetched list
-  would silently block real Cloudflare traffic. If the fallback is used, refresh later
+- **The box has no `jq`.** Run `tailscale status --json | jq` locally, or use
+  `tailscale status --self --peers=false` on the box.
+- **Cloudflare ranges are fetched live.** Both lists must arrive or the script uses its
+  pinned fallback wholesale — a half-fetched list would silently block real Cloudflare
+  traffic. If the fallback is used it shows in the run summary's warnings; refresh
   against <https://www.cloudflare.com/ips/>.
-- **Tailscale API keys expire** (90 days max). A failing policy or key call with 401 is
+- **Tailscale API keys expire** (90 days max). A policy or key call failing with 401 is
   usually just an expired `TAILSCALE_API_KEY`.
-- **Break-glass is the Hetzner Cloud Console** (VNC, or Rescue mode). There is no key to
-  fall back on, by design.
 - After running, record in `servers/<project>/AGENTS.md` that the box was secured with
-  `skills/lockdown` and note any non-default config used.
+  `skills/lockdown` and note any non-default config used — unless it is a throwaway, in
+  which case skip the folder and destroy the box per **Decommissioning**.

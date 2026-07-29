@@ -24,9 +24,13 @@ Before changing the tailnet policy, back it up and merge additively with an `If-
 
 When provisioning a server, ask step-by-step for answers to the configuration settings. How much RAM, x86 or ARM, location, etc. Don't assume, and always ask one step at a time to allow for easy Q&A back and forth. Keep responses extra concise during this setup stage. This rule can be overriden if I point you to a skill for provisioning or if I've asked you to make the decisions.
 
+Present only options that can actually be ordered. A Hetzner server type is *priced* in more locations than it is *available* in, so the price list alone will lead you to offer a box that fails to create — **skills/lockdown** has the query that accounts for availability.
+
 Create servers with **skills/lockdown**'s script as cloud-init user-data so the box hardens itself and joins the tailnet on first boot. That is the default path — it means the machine is never touched before it is secured.
 
 After provisioning a server, always create an AGENTS.md file at **servers/project-name/AGENTS.md** with a section detailing the basics of the machine for all future agent reference.
+
+Exception: a throwaway box — a validation or test machine you intend to destroy in the same session — gets no `servers/` folder. Writing one leaves a directory describing a machine that no longer exists. If you did create one, delete it as part of decommissioning, and always destroy the Tailscale device alongside the Hetzner server so stale nodes don't accumulate in the tailnet.
 
 # Setup
 

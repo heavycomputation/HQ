@@ -16,3 +16,4 @@ servers/*/
 scratch/
 .DS_Store
 TAILSCALE-SSH-MIGRATION.md
+HQ-FINDINGS-*.md
