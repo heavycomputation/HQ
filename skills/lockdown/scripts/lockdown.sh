@@ -8,12 +8,17 @@
 #
 # Configuration comes from the environment:
 #
-#   TAILSCALE_AUTHKEY     (required)  reusable, non-ephemeral Tailscale auth key
+#   TAILSCALE_AUTHKEY     (required)  node auth key (tskey-auth-...) to join the tailnet
 #   TAILSCALE_HOSTNAME    (optional)  name to register in your tailnet (default: hostname)
 #   TAILSCALE_TAGS        (optional)  comma-separated ACL tags, e.g. "tag:server"
 #   CREATE_DEPLOY_USER    (optional)  "true" to create a non-root sudo user (default: true)
 #   DEPLOY_USER           (optional)  name of that user (default: deploy)
 #   ALLOW_CLOUDFLARE_WEB  (optional)  "true" opens 80/443 to Cloudflare only (default: true)
+#
+# TAILSCALE_AUTHKEY is a *node* auth key, not the TAILSCALE_API_KEY from .env. The
+# agent mints a fresh single-use one per box from the API key; see SKILL.md. This
+# script never sees the API key — a tailnet-wide credential has no business sitting
+# in cloud-init user-data, which stays readable on the box after boot.
 #
 # Administrative access is Tailscale SSH: tailscaled itself answers port 22 on the
 # tailnet address and authorizes you against your tailnet identity and SSH policy.
@@ -46,6 +51,7 @@ fi
 
 if [ -z "$TAILSCALE_AUTHKEY" ]; then
   echo "[lockdown] TAILSCALE_AUTHKEY is required — it is the only way back into this box." >&2
+  echo "[lockdown] Mint one from TAILSCALE_API_KEY: POST /api/v2/tailnet/-/keys (see SKILL.md)." >&2
   exit 1
 fi
 
@@ -55,12 +61,34 @@ echo "  host: $TAILSCALE_HOSTNAME"
 echo "================================================"
 
 export DEBIAN_FRONTEND=noninteractive
+# Ubuntu 22.04+ ships needrestart, which interrupts non-interactive apt runs with a
+# service-restart prompt that DEBIAN_FRONTEND does not suppress. 'a' = restart
+# automatically, no questions — the only safe answer with nobody at the console.
+export NEEDRESTART_MODE=a
+export NEEDRESTART_SUSPEND=1
+
+# On first boot, cloud-init and the apt-daily / unattended-upgrades timers are usually
+# still holding the dpkg lock. Without this, the very first apt-get dies under set -e
+# and the box is left unsecured. DPkg::Lock::Timeout handles most of it; the retry
+# loop covers the rest.
+apt_get() {
+  local tries=0
+  until apt-get -o DPkg::Lock::Timeout=60 "$@"; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 20 ]; then
+      log "!! 'apt-get $1' failed after $tries attempts — giving up."
+      return 1
+    fi
+    log "'apt-get $1' failed (attempt $tries) — dpkg lock is probably still held; retrying in 15s..."
+    sleep 15
+  done
+}
 
 # ----- 1. Update packages ----------------------------------------------------
 log "[1/6] Updating packages..."
-apt-get update -y
-apt-get upgrade -y
-apt-get install -y curl ufw unattended-upgrades
+apt_get update -y
+apt_get upgrade -y
+apt_get install -y curl ufw unattended-upgrades
 
 # ----- 2. Unattended security upgrades ---------------------------------------
 log "[2/6] Enabling unattended security upgrades..."
@@ -94,6 +122,13 @@ if ! command -v tailscale &>/dev/null; then
   curl -fsSL https://tailscale.com/install.sh | sh
 fi
 
+# The installer starts tailscaled, but 'tailscale up' immediately after can beat the
+# daemon to its socket and fail for no real reason.
+for _ in $(seq 1 30); do
+  systemctl is-active --quiet tailscaled && break
+  sleep 1
+done
+
 TS_ARGS=(--authkey="$TAILSCALE_AUTHKEY" --hostname="$TAILSCALE_HOSTNAME" --ssh)
 [ -n "$TAILSCALE_TAGS" ] && TS_ARGS+=(--advertise-tags="$TAILSCALE_TAGS")
 
@@ -110,8 +145,9 @@ fi
 if [ -z "$TAILSCALE_IP" ]; then
   log "!! Tailnet join did not confirm — aborting before the box is sealed."
   log "!! Nothing has been firewalled; this machine is unchanged and still reachable."
-  log "!! Usual causes: expired or single-use auth key, or a key not authorized to"
-  log "!! assign TAILSCALE_TAGS='$TAILSCALE_TAGS'. Fix the key and re-run this script."
+  log "!! Usual causes: an expired or already-spent auth key, or a key not authorized"
+  log "!! to assign TAILSCALE_TAGS='$TAILSCALE_TAGS' (the tag needs a tagOwners entry"
+  log "!! in the tailnet policy). Mint a fresh key and re-run this script."
   exit 1
 fi
 log "Tailscale up. IP: $TAILSCALE_IP"
@@ -130,8 +166,14 @@ KbdInteractiveAuthentication no
 PermitRootLogin no
 EOF
 chmod 644 "$SSHD_CONF"
-# Ubuntu 24.04 uses the 'ssh' unit; older releases use 'sshd'.
-sshd -t && { systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true; }
+# cloud-init's PATH does not always include /usr/sbin, where sshd lives.
+SSHD_BIN="$(command -v sshd || echo /usr/sbin/sshd)"
+if [ -x "$SSHD_BIN" ] && "$SSHD_BIN" -t; then
+  # Ubuntu 24.04 uses the 'ssh' unit; older releases use 'sshd'.
+  systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
+else
+  log "!! sshd config test failed or sshd not present — skipping reload."
+fi
 
 # ----- 6. Firewall (UFW), default deny ---------------------------------------
 log "[6/6] Configuring firewall (UFW)..."
@@ -147,15 +189,15 @@ ufw allow in on tailscale0 to any port 22 proto tcp comment 'ssh via tailnet'
 
 if [ "$ALLOW_CLOUDFLARE_WEB" = "true" ]; then
   log "Allowing 80/443 from Cloudflare ranges only..."
-  # Prefer the live list; fall back to a pinned copy if the fetch fails.
-  CF_RANGES="$(
-    { curl -fsSL --max-time 15 https://www.cloudflare.com/ips-v4
-      echo
-      curl -fsSL --max-time 15 https://www.cloudflare.com/ips-v6
-    } 2>/dev/null | grep -E '^[0-9a-fA-F:.]+/[0-9]+$' || true
-  )"
-  if [ -z "$CF_RANGES" ]; then
-    log "!! Could not fetch Cloudflare ranges — using pinned fallback list."
+  # Prefer the live lists. Both must arrive: a half-fetched list silently blocks a
+  # chunk of real Cloudflare traffic, which is far harder to debug than using the
+  # pinned copy wholesale.
+  CF_V4="$(curl -fsSL --max-time 15 https://www.cloudflare.com/ips-v4 2>/dev/null | grep -E '^[0-9.]+/[0-9]+$' || true)"
+  CF_V6="$(curl -fsSL --max-time 15 https://www.cloudflare.com/ips-v6 2>/dev/null | grep -E '^[0-9a-fA-F:]+/[0-9]+$' || true)"
+  if [ -n "$CF_V4" ] && [ -n "$CF_V6" ]; then
+    CF_RANGES="$CF_V4 $CF_V6"
+  else
+    log "!! Could not fetch both Cloudflare lists — using pinned fallback list."
     log "!! Refresh later against https://www.cloudflare.com/ips/"
     CF_RANGES="173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22
 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20
@@ -176,13 +218,16 @@ fi
 log "Enabling UFW..."
 ufw --force enable
 
+log "Lockdown complete on $TAILSCALE_HOSTNAME ($TAILSCALE_IP)."
+
 echo ""
 echo "================================================"
 echo "  Lockdown complete"
 echo "================================================"
 echo "  Tailscale IP : $TAILSCALE_IP"
 echo "  SSH (root)   : ssh root@$TAILSCALE_HOSTNAME"
-[ "$CREATE_DEPLOY_USER" = "true" ] && \
-echo "  SSH (deploy) : ssh $DEPLOY_USER@$TAILSCALE_HOSTNAME"
+if [ "$CREATE_DEPLOY_USER" = "true" ]; then
+  echo "  SSH (deploy) : ssh $DEPLOY_USER@$TAILSCALE_HOSTNAME"
+fi
 echo "  Log          : $SUMMARY_LOG"
 echo "================================================"

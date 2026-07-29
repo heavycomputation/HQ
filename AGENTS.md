@@ -8,13 +8,17 @@ This is HQ, a central repo from which we will provision, configure, maintain, an
 
 **skills/** - a repository for repeatable scripts, setups, configurations, and other agent instructions I intend to invoke on multiple machines
 
-**.env.example** - a template env file with placeholder fields for the Hetzner API and Tailscale auth key. A real .env file with populated values should exist
+**.env.example** - a template env file with placeholder fields for the Hetzner API token and the Tailscale API key. A real .env file with populated values should exist
 
 **readme.md** - user-facing readme file which you should not read unless explicitly asked. AGENTS.md is a sufficient entry point to gain context on the project.
 
 # Access
 
 Servers are reached over Tailscale SSH (`ssh deploy@<server-name>`), authorized by tailnet identity and the tailnet SSH policy. There are no SSH keys anywhere in this workflow — do not generate one, do not add one to a Hetzner server, and do not write to an authorized_keys file on a box. If a server is unreachable, the break-glass path is the Hetzner Cloud Console, not a key.
+
+The two API credentials in `.env` are the whole toolkit — the user should not have to create anything else by hand. `TAILSCALE_API_KEY` is a REST token, not a node credential: use it to read and update the tailnet policy and to mint a fresh single-use auth key per box. Never put `TAILSCALE_API_KEY` into cloud-init user-data; user-data stays readable on the box after boot. **skills/lockdown** covers the exact calls.
+
+Before changing the tailnet policy, back it up and merge additively with an `If-Match` ETag — a careless write there can lock the user out of their own tailnet.
 
 # Provisioning
 

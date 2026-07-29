@@ -21,9 +21,16 @@ On your machine:
 git clone https://github.com/heavycomputation/HQ hq && cd hq && cp .env.example .env
 ```
 
-Then populate fields in new .env file with real secrets
+You need exactly two credentials in that `.env`:
 
-Finally boot your agent and ask it to provision a new server
+- **`HETZNER_API_TOKEN`** — Hetzner Cloud Console → Security → API Tokens (Read & Write)
+- **`TAILSCALE_API_KEY`** — Tailscale admin → Settings → Keys → Generate API key
+
+That is the whole setup. Everything else — the tailnet policy, auth keys, the server
+itself — your agent handles from those two.
+
+Install Tailscale on your own machine and sign into the same tailnet, since that is how
+you reach your servers. Then boot your agent and ask it to provision a new server.
 
 ## License
 
