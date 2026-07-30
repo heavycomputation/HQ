@@ -342,3 +342,4 @@ whether the box is exposed. All subprocess output is mirrored into
 - After running, record in `servers/<project>/AGENTS.md` that the box was secured with
   `skills/lockdown` and note any non-default config used — unless it is a throwaway, in
   which case skip the folder and destroy the box per **Decommissioning**.
+

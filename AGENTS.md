@@ -42,3 +42,4 @@ After setting up the server, always add a section in **servers/project-name/AGEN
 
 Most work will take place in **servers/** on a particular project. Take care to update the server project's AGENTS.md file with critical information a future agent may need. Be critical about updating the file - we don't want AGENTS.md becoming uber long and full of logs which may distract future agents.
 
+
