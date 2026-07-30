@@ -226,11 +226,22 @@ PermitRootLogin no
 EOF
 chmod 644 "$SSHD_CONF"
 
+# 'sshd -t' and 'sshd -T' both need the privilege separation directory, which systemd
+# creates from RuntimeDirectory=sshd only when ssh.service actually starts. Ubuntu
+# 24.04 socket-activates sshd, and step 3 sealed the box so nothing ever connects —
+# meaning on a fresh box /run/sshd does not exist yet and both calls exit 255 with
+# "Missing privilege separation directory". That silently skipped the verification
+# below on 100% of fresh boxes.
+mkdir -p /run/sshd
+
 # cloud-init's PATH does not always include /usr/sbin, where sshd lives.
 SSHD_BIN="$(command -v sshd || echo /usr/sbin/sshd)"
 if [ -x "$SSHD_BIN" ] && "$SSHD_BIN" -t; then
-  # Ubuntu 24.04 uses the 'ssh' unit; older releases use 'sshd'.
-  systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
+  # Under socket activation ssh.service is inactive and needs no reload — sshd reads
+  # its config afresh per connection. try-reload-or-restart is a no-op on an inactive
+  # unit, and reloads a traditional always-running sshd where there is one.
+  systemctl try-reload-or-restart ssh.service 2>/dev/null \
+    || systemctl try-reload-or-restart sshd.service 2>/dev/null || true
 
   # Verify the *effective* config rather than trusting that writing a file worked.
   SSHD_EFFECTIVE="$("$SSHD_BIN" -T 2>/dev/null || true)"

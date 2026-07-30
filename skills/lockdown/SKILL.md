@@ -309,6 +309,16 @@ whether the box is exposed. All subprocess output is mirrored into
   sort order. cloud-init ships `50-cloud-init.conf` with `PasswordAuthentication yes`,
   so the hardening drop-in must sort before it — hence `00-hq-hardening.conf`. Always
   check `sshd -T`, never just that the file was written.
+- **`sshd -t`/`-T` need `/run/sshd` to exist.** systemd creates it from
+  `RuntimeDirectory=sshd` only when `ssh.service` starts, and Ubuntu 24.04
+  socket-activates sshd — so on a sealed fresh box, where nothing ever connects, it
+  does not exist and both calls fail with *Missing privilege separation directory*.
+  The script does `mkdir -p /run/sshd` first. If you check by hand on a fresh box, do
+  the same or you will get a false negative.
+- **Tag your servers.** An untagged node inherits the key creator's identity and the
+  default ~180-day key expiry; when it expires the box silently drops off the tailnet
+  and the only way back is the Hetzner console. This is the nastiest slow-burn failure
+  in the workflow — the box works fine for six months and then vanishes.
 - **`"action": "accept"`, never `"check"`.** The stock policy's SSH rule is `check`,
   which forces an interactive browser re-auth and will stall an unattended agent
   mid-run. The stock rule also targets `autogroup:self`, which does not match a tagged
